@@ -357,6 +357,17 @@ function getMainAgent(sessionId) {
  * Such names are safe to overwrite with a transcript-derived ai-title; a real
  * user-chosen name is not.
  */
+const REMOTE_LABEL_RE = /^(\[[^\]\n]{1,40}\]) /;
+/**
+ * Push-owned sessions are named "[machine] <title>" by the collector. Split that label off so title
+ * syncing can treat the remainder as the name while keeping the label on every write.
+ */
+function splitRemoteLabel(session) {
+  const name = (session && session.name) || "";
+  const m = session && session.source === REMOTE_PUSH_SOURCE ? REMOTE_LABEL_RE.exec(name) : null;
+  return m ? { label: `${m[1]} `, bare: name.slice(m[0].length) } : { label: "", bare: name };
+}
+
 function isAutoSessionName(name, sessionId, cwd) {
   if (!name || !name.trim()) return true;
   if (name === `Session ${sessionId.slice(0, 8)}`) return true;
@@ -413,11 +424,14 @@ function syncSessionName(session, result) {
   if (!session || !result) return;
   const custom = result.customTitle && result.customTitle.trim();
   const ai = result.aiTitle && result.aiTitle.trim();
-  const desired = custom || ai || null;
-  if (!desired) return;
+  const title = custom || ai || null;
+  if (!title) return;
+  // Push-owned sessions carry a collector label ("[remote] ..."); judge and replace only the part
+  // after it, and keep the label on whatever name we write.
+  const { label, bare } = splitRemoteLabel(session);
+  const desired = label + title;
   const replaceable =
-    isAutoSessionName(session.name, session.id, session.cwd) ||
-    session.name === firstUserLabel(result);
+    isAutoSessionName(bare, session.id, session.cwd) || bare === firstUserLabel(result);
   if (!custom && !replaceable) return;
   const upd = stmts.updateSessionName.run(desired, session.id, desired);
   if (upd.changes > 0) {
@@ -441,8 +455,10 @@ function applyFirstUserDescriptor(sessionId, result) {
   if (!label) return;
 
   const session = stmts.getSession.get(sessionId);
-  if (session && isAutoSessionName(session.name, session.id, session.cwd)) {
-    const upd = stmts.updateSessionName.run(label, session.id, label);
+  const split = splitRemoteLabel(session);
+  if (session && isAutoSessionName(split.bare, session.id, session.cwd)) {
+    const desiredName0 = split.label + label;
+    const upd = stmts.updateSessionName.run(desiredName0, session.id, desiredName0);
     if (upd.changes > 0) {
       const refreshed = stmts.getSession.get(session.id);
       if (refreshed) broadcast("session_updated", refreshed);
@@ -2611,6 +2627,17 @@ router.post("/ingest-transcript", (req, res) => {
   if (existing && existing.source !== REMOTE_PUSH_SOURCE) {
     return res.status(409).json({
       error: { code: "SESSION_LOCALLY_OWNED", message: `session ${sessionId} is not remote-push owned` },
+    });
+  }
+  // The session row must exist first (created by /ingest-batch as remote_push). Otherwise the
+  // server's own projects-dir sweep could find the file before any row exists and import it as a
+  // locally-owned session, which would lock this collector out of the session.
+  if (!existing) {
+    return res.status(409).json({
+      error: {
+        code: "SESSION_NOT_REGISTERED",
+        message: `register session ${sessionId} with /ingest-batch before uploading its transcript`,
+      },
     });
   }
 
