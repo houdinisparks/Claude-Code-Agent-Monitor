@@ -7,6 +7,7 @@
  */
 
 const { Router } = require("express");
+const fs = require("fs");
 const { v4: uuidv4 } = require("uuid");
 const dbModule = require("../db");
 const { stmts, db } = dbModule;
@@ -26,6 +27,13 @@ const { getRemotePushToken, extractHeaderOnlyToken, tokensMatch } = require("../
 const { REMOTE_PROVIDERS, assertProvider } = require("../lib/remote-sync");
 const { normalizeSpeed, normalizeGeo, normalizeTier } = require("../lib/token-usage");
 const { isCursorTranscriptPath } = require("../lib/cursor-home");
+const { getProjectsDir } = require("../lib/claude-home");
+const {
+  TranscriptPathError,
+  isValidSessionId,
+  resolveTranscriptPath,
+  appendChunk,
+} = require("../lib/remote-transcript");
 
 const router = Router();
 
@@ -532,7 +540,8 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
   //   might be a Stop. For error sessions, Stop should NOT reactivate.
   // - SessionEnd never reactivates.
   const isUserAction = hookType === "UserPromptSubmit" || hookType === "PreToolUse";
-  const isNonTerminalEvent = hookType !== "SessionEnd";
+  // RemoteSync (POST /ingest-transcript) only refreshes derived data; it never changes liveness.
+  const isNonTerminalEvent = hookType !== "SessionEnd" && hookType !== "RemoteSync";
   const isStopLike = hookType === "Stop" || hookType === "SubagentStop";
   const isImportedOrAbandoned = session.status === "completed" || session.status === "abandoned";
   const needsReactivation =
@@ -1288,6 +1297,19 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
 
   // Bump session updated_at on every event
   stmts.touchSession.run(sessionId);
+
+  // A transcript-sync pass exists for the derived data written above (tokens, compactions, turn
+  // timings, titles); recording it as an event would add a feed row per push.
+  if (hookType === "RemoteSync") {
+    return {
+      session_id: sessionId,
+      agent_id: agentId,
+      event_type: eventType,
+      tool_name: null,
+      summary: null,
+      created_at: new Date().toISOString(),
+    };
+  }
 
   stmts.insertEvent.run(
     sessionId,
@@ -2500,6 +2522,124 @@ router.post("/ingest-batch", (req, res) => {
 const watchdogTimer = setInterval(watchdogCheck, WATCHDOG_INTERVAL_MS);
 // Don't keep the process alive just for the watchdog
 if (watchdogTimer.unref) watchdogTimer.unref();
+
+// ── POST /api/hooks/ingest-transcript ────────────────────────────────────────────────────────
+// Remote machines push their Claude Code transcripts (main + subagent JSONL) here, append-only.
+// Files land in this server's Claude projects dir in Claude Code's own layout (see
+// lib/remote-transcript.js), so tokens, compactions, API errors, turn timings, titles, the
+// transcript viewer and the subagent import all work on them exactly as for local sessions.
+// Auth is REMOTE_PUSH_TOKEN, identical to /ingest-batch.
+const REMOTE_TRANSCRIPT_MAX_FILE_BYTES = (() => {
+  const mb = parseInt(process.env.REMOTE_TRANSCRIPT_MAX_FILE_MB, 10);
+  return (Number.isFinite(mb) && mb > 0 ? mb : 256) * 1024 * 1024;
+})();
+
+/** Re-derive everything CCAM derives from a session's transcript files, then import subagents. */
+function syncRemoteTranscript(sessionId, mainAbs, meta) {
+  if (!fs.existsSync(mainAbs)) return;
+  processEvent(
+    "RemoteSync",
+    {
+      session_id: sessionId,
+      transcript_path: mainAbs,
+      cwd: meta.cwd,
+      session_name: meta.sessionName,
+    },
+    { remotePush: true }
+  );
+
+  // Same sequence as the SubagentStop branch of POST /event: tell the subagent scan which models
+  // the live combined-transcript writer already owns so it does not double-write those buckets.
+  let parentModels = [];
+  try {
+    const mainResult = transcriptCache.extract(mainAbs);
+    const live = combineLiveSessionTokens(mainAbs, mainResult?.tokensByModel || null);
+    if (live) parentModels = Object.values(live).map((b) => b.model).filter(Boolean);
+    if (mainResult?.latestModel) parentModels.push(mainResult.latestModel);
+  } catch {
+    /* the scan falls back to the stored session.model */
+  }
+  scanAndImportSubagents(dbModule, sessionId, mainAbs, { parentModels })
+    .then(({ created, reparented }) => {
+      if (created > 0 || reparented > 0) {
+        broadcast("new_event", {
+          session_id: sessionId,
+          agent_id: null,
+          event_type: "SubagentJsonlImported",
+          tool_name: null,
+          summary: `Imported ${created} subagent record(s), re-parented ${reparented}`,
+          created_at: new Date().toISOString(),
+        });
+      }
+    })
+    .catch(() => {
+      /* partial JSONL during a live run is expected */
+    });
+}
+
+router.post("/ingest-transcript", (req, res) => {
+  const expectedToken = getRemotePushToken();
+  if (!expectedToken) {
+    return res.status(503).json({
+      error: { code: "REMOTE_PUSH_NOT_CONFIGURED", message: "remote push ingestion is not enabled" },
+    });
+  }
+  if (!tokensMatch(extractHeaderOnlyToken(req), expectedToken)) {
+    return res.status(401).json({
+      error: { code: "EUNAUTHORIZED", message: "missing or invalid remote-push token" },
+    });
+  }
+  const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
+  const invalid = (message) =>
+    res.status(400).json({ error: { code: "INVALID_INPUT", message } });
+
+  if (body.provider !== undefined && body.provider !== "claude") return invalid("provider must be claude");
+  const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
+  if (!isValidSessionId(sessionId)) return invalid("session_id is required");
+  if (typeof body.content_b64 !== "string") return invalid("content_b64 is required");
+
+  let resolved;
+  try {
+    resolved = resolveTranscriptPath(getProjectsDir(), sessionId, body.rel_path);
+  } catch (err) {
+    if (err instanceof TranscriptPathError) return invalid(err.message);
+    throw err;
+  }
+
+  // Same ownership rule as /ingest-batch: never write into a locally-managed session.
+  const existing = stmts.getSession.get(sessionId);
+  if (existing && existing.source !== REMOTE_PUSH_SOURCE) {
+    return res.status(409).json({
+      error: { code: "SESSION_LOCALLY_OWNED", message: `session ${sessionId} is not remote-push owned` },
+    });
+  }
+
+  const result = appendChunk(resolved.abs, body.offset, Buffer.from(body.content_b64, "base64"), {
+    maxFileBytes: REMOTE_TRANSCRIPT_MAX_FILE_BYTES,
+  });
+  if (!result.ok) {
+    return res
+      .status(result.status)
+      .json({ error: { code: result.code, message: result.code }, size: result.size });
+  }
+  res.json({ ok: true, size: result.size });
+
+  // Chunks are written with sync:false; the client sets sync:true once per session per pass, so a
+  // large backfill is parsed once instead of once per chunk.
+  if (body.sync === true) {
+    setImmediate(() => {
+      try {
+        syncRemoteTranscript(sessionId, resolved.mainAbs, {
+          cwd: typeof body.cwd === "string" && body.cwd ? body.cwd : undefined,
+          sessionName:
+            typeof body.session_name === "string" && body.session_name ? body.session_name : undefined,
+        });
+      } catch (err) {
+        console.error("[ingest-transcript] sync failed for", sessionId, err && err.message);
+      }
+    });
+  }
+});
 
 router.transcriptCache = transcriptCache;
 router.watchdogCheck = watchdogCheck;
