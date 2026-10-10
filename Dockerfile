@@ -69,18 +69,3 @@ HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["node", "server/index.js"]
-
-# ── Optional agent execution runtime ──────────────────────────────────
-# The dashboard image above supports the full monitoring/import/config surface.
-# Build this target only when the Run page must launch Claude Code or Codex
-# inside the container. Pin both CLIs at build time for reproducible releases.
-FROM runtime AS agent-runtime
-ARG CLAUDE_CODE_VERSION=2.1.222
-ARG CODEX_VERSION=0.146.0
-
-USER root
-RUN npm install --global \
-      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-      "@openai/codex@${CODEX_VERSION}" \
-  && npm cache clean --force
-USER node
