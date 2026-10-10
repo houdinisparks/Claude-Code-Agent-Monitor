@@ -62,7 +62,6 @@ ENV NODE_ENV=production \
     DASHBOARD_HOST=0.0.0.0 \
     DASHBOARD_LIVENESS_PROBE=0
 
-VOLUME ["/app/data", "/app/config"]
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
   CMD ["node", "-e", "fetch('http://127.0.0.1:4820/api/health').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"]
