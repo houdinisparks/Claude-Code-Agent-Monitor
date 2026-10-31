@@ -30,6 +30,7 @@ const { isCursorTranscriptPath } = require("../lib/cursor-home");
 const { getProjectsDir } = require("../lib/claude-home");
 const {
   TranscriptPathError,
+  decodeBase64Strict,
   isValidSessionId,
   resolveTranscriptPath,
   appendChunk,
@@ -454,9 +455,15 @@ function applyFirstUserDescriptor(sessionId, result) {
   const label = firstUserLabel(result);
   if (!label) return;
 
+  // A transcript title already had its turn in syncSessionName. It can look
+  // like a placeholder (a /rename to the project folder's name matches the
+  // cwd-basename fallback), so never let the descriptor take the name back.
+  const hasTitle = Boolean(
+    (result.customTitle && result.customTitle.trim()) || (result.aiTitle && result.aiTitle.trim())
+  );
   const session = stmts.getSession.get(sessionId);
   const split = splitRemoteLabel(session);
-  if (session && isAutoSessionName(split.bare, session.id, session.cwd)) {
+  if (session && !hasTitle && isAutoSessionName(split.bare, session.id, session.cwd)) {
     const desiredName0 = split.label + label;
     const upd = stmts.updateSessionName.run(desiredName0, session.id, desiredName0);
     if (upd.changes > 0) {
@@ -1135,7 +1142,12 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
       // genuinely current error (tail) is left in place.
       {
         const curSession = stmts.getSession.get(sessionId);
-        if (curSession && curSession.status === "error" && !isErrorAtTail(result)) {
+        if (
+          hookType !== "RemoteSync" &&
+          curSession &&
+          curSession.status === "error" &&
+          !isErrorAtTail(result)
+        ) {
           stmts.reactivateSession.run(sessionId);
           broadcast("session_updated", stmts.getSession.get(sessionId));
           const curMain = mainAgentId ? stmts.getAgent.get(mainAgentId) : null;
@@ -1311,12 +1323,16 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
     transcriptCache.invalidate(data.transcript_path);
   }
 
-  // Bump session updated_at on every event
-  stmts.touchSession.run(sessionId);
-
   // A transcript-sync pass exists for the derived data written above (tokens, compactions, turn
-  // timings, titles); recording it as an event would add a feed row per push.
+  // timings, titles); recording it as an event would add a feed row per push. Derived metadata
+  // writers normally bump updated_at, so restore the pre-sync value to keep inactivity semantics.
   if (hookType === "RemoteSync") {
+    const restored = stmts.restoreSessionUpdatedAt.run(
+      session.updated_at,
+      sessionId,
+      session.updated_at
+    );
+    if (restored.changes > 0) broadcast("session_updated", stmts.getSession.get(sessionId));
     return {
       session_id: sessionId,
       agent_id: agentId,
@@ -1326,6 +1342,9 @@ const processEvent = db.transaction((hookType, data, origin = null) => {
       created_at: new Date().toISOString(),
     };
   }
+
+  // Bump session updated_at on every real hook event.
+  stmts.touchSession.run(sessionId);
 
   stmts.insertEvent.run(
     sessionId,
@@ -2553,6 +2572,11 @@ const REMOTE_TRANSCRIPT_MAX_FILE_BYTES = (() => {
 /** Re-derive everything CCAM derives from a session's transcript files, then import subagents. */
 function syncRemoteTranscript(sessionId, mainAbs, meta) {
   if (!fs.existsSync(mainAbs)) return;
+  const session = stmts.getSession.get(sessionId);
+  if (!session || session.source !== REMOTE_PUSH_SOURCE) return;
+  // A forwarded hook may have stored the origin machine's absolute path first. Once the validated
+  // upload exists locally, every transcript reader and background scanner must use this copy.
+  stmts.replaceSessionTranscriptPath.run(mainAbs, sessionId);
   processEvent(
     "RemoteSync",
     {
@@ -2570,7 +2594,10 @@ function syncRemoteTranscript(sessionId, mainAbs, meta) {
   try {
     const mainResult = transcriptCache.extract(mainAbs);
     const live = combineLiveSessionTokens(mainAbs, mainResult?.tokensByModel || null);
-    if (live) parentModels = Object.values(live).map((b) => b.model).filter(Boolean);
+    if (live)
+      parentModels = Object.values(live)
+        .map((b) => b.model)
+        .filter(Boolean);
     if (mainResult?.latestModel) parentModels.push(mainResult.latestModel);
   } catch {
     /* the scan falls back to the stored session.model */
@@ -2597,7 +2624,10 @@ router.post("/ingest-transcript", (req, res) => {
   const expectedToken = getRemotePushToken();
   if (!expectedToken) {
     return res.status(503).json({
-      error: { code: "REMOTE_PUSH_NOT_CONFIGURED", message: "remote push ingestion is not enabled" },
+      error: {
+        code: "REMOTE_PUSH_NOT_CONFIGURED",
+        message: "remote push ingestion is not enabled",
+      },
     });
   }
   if (!tokensMatch(extractHeaderOnlyToken(req), expectedToken)) {
@@ -2606,10 +2636,10 @@ router.post("/ingest-transcript", (req, res) => {
     });
   }
   const body = req.body && typeof req.body === "object" && !Array.isArray(req.body) ? req.body : {};
-  const invalid = (message) =>
-    res.status(400).json({ error: { code: "INVALID_INPUT", message } });
+  const invalid = (message) => res.status(400).json({ error: { code: "INVALID_INPUT", message } });
 
-  if (body.provider !== undefined && body.provider !== "claude") return invalid("provider must be claude");
+  if (body.provider !== undefined && body.provider !== "claude")
+    return invalid("provider must be claude");
   const sessionId = typeof body.session_id === "string" ? body.session_id.trim() : "";
   if (!isValidSessionId(sessionId)) return invalid("session_id is required");
   if (typeof body.content_b64 !== "string") return invalid("content_b64 is required");
@@ -2626,7 +2656,10 @@ router.post("/ingest-transcript", (req, res) => {
   const existing = stmts.getSession.get(sessionId);
   if (existing && existing.source !== REMOTE_PUSH_SOURCE) {
     return res.status(409).json({
-      error: { code: "SESSION_LOCALLY_OWNED", message: `session ${sessionId} is not remote-push owned` },
+      error: {
+        code: "SESSION_LOCALLY_OWNED",
+        message: `session ${sessionId} is not remote-push owned`,
+      },
     });
   }
   // The session row must exist first (created by /ingest-batch as remote_push). Otherwise the
@@ -2641,9 +2674,19 @@ router.post("/ingest-transcript", (req, res) => {
     });
   }
 
-  const result = appendChunk(resolved.abs, body.offset, Buffer.from(body.content_b64, "base64"), {
-    maxFileBytes: REMOTE_TRANSCRIPT_MAX_FILE_BYTES,
-  });
+  const chunk = decodeBase64Strict(body.content_b64);
+  if (!chunk) return invalid("content_b64 is not valid base64");
+
+  let result;
+  try {
+    result = appendChunk(resolved.abs, body.offset, chunk, {
+      maxFileBytes: REMOTE_TRANSCRIPT_MAX_FILE_BYTES,
+      projectsDir: getProjectsDir(),
+    });
+  } catch (err) {
+    if (err instanceof TranscriptPathError) return invalid(err.message);
+    throw err;
+  }
   if (!result.ok) {
     return res
       .status(result.status)
@@ -2659,7 +2702,9 @@ router.post("/ingest-transcript", (req, res) => {
         syncRemoteTranscript(sessionId, resolved.mainAbs, {
           cwd: typeof body.cwd === "string" && body.cwd ? body.cwd : undefined,
           sessionName:
-            typeof body.session_name === "string" && body.session_name ? body.session_name : undefined,
+            typeof body.session_name === "string" && body.session_name
+              ? body.session_name
+              : undefined,
         });
       } catch (err) {
         console.error("[ingest-transcript] sync failed for", sessionId, err && err.message);

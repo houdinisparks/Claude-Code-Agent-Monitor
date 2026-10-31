@@ -49,6 +49,7 @@ const {
   hostGuard,
   tokenGuard,
   hookGuard,
+  remotePushGuard,
   getDashboardToken,
 } = require("./lib/security");
 
@@ -93,10 +94,11 @@ function createApp() {
   // allowlist (anti DNS-rebinding), and an optional bearer-token gate on /api/*.
   app.use(cors(corsOptions()));
   app.use(hostGuard);
-  // Transcript chunks are base64 inside JSON (up to ~5.4 MB); mount a larger parser for that one route
-// first. body-parser skips a request it already parsed, so the global 1 MB limit below does not apply.
-app.use("/api/hooks/ingest-transcript", express.json({ limit: "8mb" }));
-app.use(express.json({ limit: "1mb" }));
+  // Authenticate before buffering transcript chunks from this public-internet route. Chunks are
+  // base64 inside JSON (up to ~5.4 MB), so this one path then gets a larger parser. body-parser
+  // skips a request it already parsed, leaving the global 1 MB limit below unchanged elsewhere.
+  app.use("/api/hooks/ingest-transcript", remotePushGuard, express.json({ limit: "8mb" }));
+  app.use(express.json({ limit: "1mb" }));
   app.use("/api", tokenGuard);
   app.use("/api/hooks", hookGuard);
 
